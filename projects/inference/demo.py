@@ -162,6 +162,7 @@ class Trainer:
         self.accelerator = accelerator
 
         # init traiable params
+        # 设置杨氏模量
         E_nu_list = self.init_trainable_params()
         for p in E_nu_list:
             p.requires_grad = False
@@ -210,6 +211,7 @@ class Trainer:
         device = "cuda:{}".format(self.accelerator.process_index)
 
         xyzs = self.render_params.gaussians.get_xyz.detach().clone()
+        # 一些过远的点被 mask 掉不会参与 simulation
         sim_xyzs = xyzs[self.sim_mask_in_raw_gaussian, :]
 
         # scale, and shift
@@ -220,6 +222,7 @@ class Trainer:
         self.scale, self.shift = scale, shift
         print("scale, shift", scale, shift)
 
+        # 可以对内部点进行填充，但是不参与 simulation
         # load internal filled points.
         #   if exists, we will use it to fill in the internal points, but not for rendering
         #   we keep track of render_mask_in_sim_pts, to distinguish the orignal points from the internal filled points
@@ -250,11 +253,13 @@ class Trainer:
             self.fill_xyzs = None
             self.render_mask = torch.ones_like(sim_xyzs[:, 0]).bool().to(device)
 
+        # 对 scale 进行调整，设置 bounding box
         sim_xyzs = (sim_xyzs + shift) / scale
         sim_aabb = torch.stack(
             [torch.min(sim_xyzs, dim=0)[0], torch.max(sim_xyzs, dim=0)[0]], dim=0
         )
         # This AABB is used to constraint the material fields and velocity fields.
+        # AABB 范围扩大 20%，中心不变
         sim_aabb = (
             sim_aabb - torch.mean(sim_aabb, dim=0, keepdim=True)
         ) * 1.2 + torch.mean(sim_aabb, dim=0, keepdim=True)
@@ -382,6 +387,7 @@ class Trainer:
             torch.ones_like(self.particle_init_position[..., 0])
             * self.E_nu_list[0].detach()
         )
+        # poisson_ratio 手动设置为固定的值
         poisson_ratio = torch.ones_like(self.particle_init_position[..., 0]) * 0.3
         self.density = density
         self.young_modulus = youngs_modulus
@@ -398,7 +404,9 @@ class Trainer:
             mpm_model, youngs_modulus.clone(), poisson_ratio.clone(), device
         )
         mpm_solver.prepare_mu_lam(mpm_model, mpm_state, device)
-
+        
+        # 分两个计算训练 sim_fields 和 velo_fields
+        # 使用了 TriplaneFields 结构
         self.sim_fields = create_spatial_fields(self.args, 1, sim_aabb)
         self.sim_fields.train()
 
@@ -441,9 +449,11 @@ class Trainer:
         density, youngs_modulus, ret_poisson = self.get_material_params(device)
         initial_position_time0 = self.particle_init_position.clone()
 
+        # self.freeze_mask 这部分的区域不会进行 simulation
         query_mask = torch.logical_not(self.freeze_mask)
         query_pts = initial_position_time0[query_mask, :]
-
+        
+        # 获得初始化的速度, 用 TriplaneFields 来优化
         velocity = self.velo_fields(query_pts)[..., :3]
 
         # scaling lr is similar to scaling the learning rate of velocity fields.
@@ -481,6 +491,7 @@ class Trainer:
         # query the materials params of all particles
         query_pts = initial_position_time0
 
+        # 这里也是一个 TriplaneFields
         sim_params = self.sim_fields(query_pts)
 
         # scale the output of the network, similar to scale the learning rate
